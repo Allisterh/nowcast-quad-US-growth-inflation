@@ -6,7 +6,9 @@ Exit code 0 on success, 1 on failure (for Task Scheduler alerting).
 """
 
 import argparse
+import os
 import subprocess
+import time
 import sys
 import traceback
 from datetime import datetime
@@ -18,6 +20,23 @@ from nowcast import notify_remote, pipeline, quads
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 NOTIFY_PS1 = Path(__file__).resolve().parent / "notify.ps1"
+LOCK_STALE_S = 30 * 60  # = the task ExecutionTimeLimit; an older lock is a crashed run
+
+
+def acquire_lock(lock_path: Path) -> bool:
+    """Atomic single-run lock. The weekly task (StartWhenAvailable) and the
+    logon catch-up both fire right after a late boot; the log-based guards
+    cannot see a run still in flight, so two ran concurrently (2026-10-13)."""
+    try:
+        if time.time() - lock_path.stat().st_mtime > LOCK_STALE_S:
+            lock_path.unlink()
+    except OSError:
+        pass
+    try:
+        os.close(os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except FileExistsError:
+        return False
 
 
 def last_success(log_path: Path) -> datetime | None:
@@ -61,52 +80,64 @@ def main() -> int:
     out_dir.mkdir(exist_ok=True)
     log_path = out_dir / "run.log"
 
-    with open(log_path, "a", encoding="utf-8") as f:
+    lock_path = out_dir / "run.lock"
+    # line-buffered so run_if_stale.ps1 sees "run start" while this is in flight
+    with open(log_path, "a", encoding="utf-8", buffering=1) as f:
         def log(msg):
             line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
             print(line)
             f.write(line + "\n")
 
-        log("========== nowcast run start ==========")
-        prev_ok = last_success(log_path)
-        if args.skip_if_fresh > 0 and not args.force and prev_ok is not None:
-            age_h = (datetime.now() - prev_ok).total_seconds() / 3600
-            if age_h < args.skip_if_fresh:
-                log(f"skipped: last success {prev_ok:%Y-%m-%d %H:%M} was "
-                    f"{age_h:.1f}h ago (< --skip-if-fresh "
-                    f"{args.skip_if_fresh:g}h); nothing run, nothing sent")
-                return 0
-        try:
-            res = pipeline.run(output_dir=out_dir, log=log)
-            log("run OK")
-            t = res["table"]
-            # the calendar quarter we are living in, not the first quarter BEA
-            # has yet to publish (pipeline.run decides; see its comment)
-            p = res.get("current_q")
-            cur = t.loc[t.index == p] if p is not None else t[t["is_estimate"]]
-            payload = {"status": "OK"}
-            if not cur.empty:
-                p, r = cur.index[0], cur.iloc[0]
-                payload = {"status": "OK",
-                           "quarter": quads.quarter_label(p, bool(r["is_estimate"])),
-                           "quad": int(r["quad"]), "quad_name": r["quad_name"],
-                           "gdp_yoy": round(float(r["gdp_yoy"]), 2),
-                           "cpi_yoy": round(float(r["cpi_yoy"]), 2),
-                           "note": res["meta"].get("GDP ensemble (approved 2026-07-14)", "")}
-                payload = notify_remote.enrich_payload(payload, res, out_dir,
-                                                       log=log)
-                toast("Nowcast Quad: run OK",
-                      f"{payload['quarter']}: Quad {payload['quad']} "
-                      f"{payload['quad_name']} — GDP {payload['gdp_yoy']}%, "
-                      f"CPI {payload['cpi_yoy']}%")
-            notify_remote.push_status(payload, log=log)
+        if not acquire_lock(lock_path):
+            log("skipped: another nowcast run is in progress (run.lock)")
             return 0
-        except Exception:
-            log("run FAILED:\n" + traceback.format_exc())
-            toast("Nowcast Quad: run FAILED", "See output\\run.log for the traceback.")
-            notify_remote.push_status(
-                {"status": "FAILED", "note": traceback.format_exc()[-500:]}, log=log)
-            return 1
+        try:
+            return _run(args, out_dir, log_path, log)
+        finally:
+            lock_path.unlink(missing_ok=True)
+
+
+def _run(args, out_dir: Path, log_path: Path, log) -> int:
+    log("========== nowcast run start ==========")
+    prev_ok = last_success(log_path)
+    if args.skip_if_fresh > 0 and not args.force and prev_ok is not None:
+        age_h = (datetime.now() - prev_ok).total_seconds() / 3600
+        if age_h < args.skip_if_fresh:
+            log(f"skipped: last success {prev_ok:%Y-%m-%d %H:%M} was "
+                f"{age_h:.1f}h ago (< --skip-if-fresh "
+                f"{args.skip_if_fresh:g}h); nothing run, nothing sent")
+            return 0
+    try:
+        res = pipeline.run(output_dir=out_dir, log=log)
+        log("run OK")
+        t = res["table"]
+        # the calendar quarter we are living in, not the first quarter BEA
+        # has yet to publish (pipeline.run decides; see its comment)
+        p = res.get("current_q")
+        cur = t.loc[t.index == p] if p is not None else t[t["is_estimate"]]
+        payload = {"status": "OK"}
+        if not cur.empty:
+            p, r = cur.index[0], cur.iloc[0]
+            payload = {"status": "OK",
+                       "quarter": quads.quarter_label(p, bool(r["is_estimate"])),
+                       "quad": int(r["quad"]), "quad_name": r["quad_name"],
+                       "gdp_yoy": round(float(r["gdp_yoy"]), 2),
+                       "cpi_yoy": round(float(r["cpi_yoy"]), 2),
+                       "note": res["meta"].get("GDP ensemble (approved 2026-07-14)", "")}
+            payload = notify_remote.enrich_payload(payload, res, out_dir,
+                                                   log=log)
+            toast("Nowcast Quad: run OK",
+                  f"{payload['quarter']}: Quad {payload['quad']} "
+                  f"{payload['quad_name']} — GDP {payload['gdp_yoy']}%, "
+                  f"CPI {payload['cpi_yoy']}%")
+        notify_remote.push_status(payload, log=log)
+        return 0
+    except Exception:
+        log("run FAILED:\n" + traceback.format_exc())
+        toast("Nowcast Quad: run FAILED", "See output\\run.log for the traceback.")
+        notify_remote.push_status(
+            {"status": "FAILED", "note": traceback.format_exc()[-500:]}, log=log)
+        return 1
 
 
 if __name__ == "__main__":
